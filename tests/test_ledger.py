@@ -123,3 +123,29 @@ def test_payment_memo_rejects_an_account_number():
             method="transfer",
             memo="acct 123456789",
         )
+
+
+def test_historical_projection_excludes_later_recorded_payments():
+    cycle = _cycle(quoted_amount=Decimal("540.00"))
+    payments = [
+        Payment(
+            id="pay_before",
+            cycle_id=cycle.id,
+            paid_on=date(2026, 10, 1),
+            amount=Decimal("100.00"),
+            method="check",
+        ),
+        Payment(
+            id="pay_after",
+            cycle_id=cycle.id,
+            paid_on=date(2026, 10, 10),
+            amount=Decimal("200.00"),
+            method="check",
+        ),
+    ]
+    early = project(cycle, build_sample_district_calendar(), date(2026, 10, 5), payments)
+    later = project(cycle, build_sample_district_calendar(), date(2026, 10, 10), payments)
+    assert early.paid == Decimal("100.00")
+    assert early.balance == Decimal("440.00")
+    assert later.paid == Decimal("300.00")
+    assert later.balance == Decimal("240.00")
