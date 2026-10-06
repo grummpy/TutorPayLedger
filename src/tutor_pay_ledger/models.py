@@ -102,6 +102,8 @@ def parse_money(value: str | Decimal | int, *, allow_zero: bool = True) -> Decim
             amount = Decimal(text)
         except Exception as exc:
             raise LedgerError(f"Invalid amount {value!r}.") from exc
+    if not amount.is_finite():
+        raise LedgerError("Amount must be finite.")
     if amount < 0 or (amount == 0 and not allow_zero):
         raise LedgerError("Amount must be greater than zero." if not allow_zero else "Amount cannot be negative.")
     exponent = amount.as_tuple().exponent

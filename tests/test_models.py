@@ -46,6 +46,12 @@ def test_money_is_cents_and_non_negative():
         parse_money("-1")
 
 
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_money_rejects_nonfinite_values(value):
+    with pytest.raises(LedgerError, match="finite"):
+        parse_money(value)
+
+
 def test_format_money_keeps_the_sign_on_a_credit():
     assert format_money(Decimal("540")) == "$540.00"
     assert format_money(Decimal("-20")) == "-$20.00"
