@@ -202,6 +202,56 @@ def test_log_payment_updates_balance_and_refuses_account_numbers(tmp_path: Path,
     assert ledger.read_text(encoding="utf-8") == before
 
 
+def test_add_or_payment_calendar_failure_never_writes_a_partial_ledger(tmp_path: Path, capsys):
+    new_ledger = tmp_path / "new-ledger.json"
+    add = main(
+        [
+            "--ledger",
+            str(new_ledger),
+            "--calendar",
+            "ics",
+            "add-cycle",
+            "--payee",
+            "Fictional service",
+            "--service",
+            "Reading",
+            "--start",
+            "2026-10-05",
+            "--end",
+            "2026-10-16",
+            "--time",
+            "3:30pm-4:30pm",
+            "--rate",
+            "40",
+        ]
+    )
+    assert add == 1
+    assert not new_ledger.exists()
+    assert "Pass --ics PATH" in capsys.readouterr().err
+
+    ledger = _seed(tmp_path)
+    capsys.readouterr()
+    before = ledger.read_bytes()
+    payment = main(
+        [
+            "--ledger",
+            str(ledger),
+            "--calendar",
+            "ics",
+            "log-payment",
+            "--cycle",
+            SEED_CYCLE_ID,
+            "--amount",
+            "10.00",
+            "--date",
+            "2026-10-05",
+        ]
+    )
+    assert payment == 1
+    assert ledger.read_bytes() == before
+    assert "Pass --ics PATH" in capsys.readouterr().err
+
+
 def test_calendar_command_and_seed_guard(tmp_path: Path, capsys):
     ledger = _seed(tmp_path)
     assert main(["--ledger", str(ledger), "seed"]) == 1

@@ -142,8 +142,14 @@ class Ledger:
                 return cycle
         raise LedgerError(f"No cycle with id {cycle_id!r}.")
 
-    def payments_for(self, cycle_id: str) -> list[Payment]:
-        return [payment for payment in self.payments if payment.cycle_id == cycle_id]
+    def payments_for(self, cycle_id: str, *, through: date | None = None) -> list[Payment]:
+        """Payments for a cycle, optionally limited to a historical date."""
+
+        return [
+            payment
+            for payment in self.payments
+            if payment.cycle_id == cycle_id and (through is None or payment.paid_on <= through)
+        ]
 
     def add_cycle(self, cycle: PayCycle) -> None:
         if any(existing.id == cycle.id for existing in self.cycles):
@@ -226,7 +232,10 @@ def project(
         agreed = cycle.quoted_amount.quantize(MONEY)
     else:
         agreed = (cycle.session_rate * total_units).quantize(MONEY)
-    paid = sum((payment.amount for payment in payments), Decimal("0.00"))
+    paid = sum(
+        (payment.amount for payment in payments if payment.paid_on <= as_of),
+        Decimal("0.00"),
+    )
     if effective_end < as_of:
         state = "ended"
     elif as_of < cycle.coverage_start:

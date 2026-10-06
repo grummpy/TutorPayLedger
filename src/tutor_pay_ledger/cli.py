@@ -184,10 +184,13 @@ def cmd_add_cycle(args: argparse.Namespace) -> int:
         note=args.note,
     )
     path = Path(args.ledger)
+    # Resolve the selected calendar and coverage before mutating the ledger.
+    # A missing local ICS file must not leave a cycle behind for a retry.
+    calendar = _calendar(args)
+    standing = project(cycle, calendar, _as_of(args), [])
     ledger = empty_ledger() if not path.exists() else load_ledger(path)
     ledger.add_cycle(cycle)
     save_ledger(path, ledger)
-    standing = project(cycle, _calendar(args), _as_of(args), [])
     who = f" for {cycle.beneficiary}" if cycle.beneficiary else ""
     print(f"Added {cycle.id}")
     print(f"  {cycle.service}{who}")
@@ -215,14 +218,14 @@ def cmd_log_payment(args: argparse.Namespace) -> int:
         method=args.method,
         memo=args.memo,
     )
+    cycle = ledger.cycle(payment.cycle_id)
+    # Validate projection against the proposed state before writing. This keeps
+    # save_ledger's atomic replacement while avoiding partial commands.
+    calendar = _calendar(args)
+    proposed_payments = [*ledger.payments_for(payment.cycle_id), payment]
+    standing = project(cycle, calendar, payment.paid_on, proposed_payments)
     ledger.log_payment(payment)
     save_ledger(path, ledger)
-    standing = project(
-        ledger.cycle(payment.cycle_id),
-        _calendar(args),
-        payment.paid_on,
-        ledger.payments_for(payment.cycle_id),
-    )
     print(
         f"Recorded {payment.id}: {format_money(payment.amount)} "
         f"on {payment.paid_on.isoformat()} ({payment.method})"
@@ -373,9 +376,9 @@ def _render_cycle(standing, ledger) -> str:
         f"{format_units(standing.remaining_units)} remaining"
     )
     lines.append(f"  Agreed:       {format_money(standing.agreed_amount)}")
-    lines.append(f"  Paid:         {format_money(standing.paid)}")
+    lines.append(f"  Paid as of:   {format_money(standing.paid)}")
     lines.append(f"  Balance:      {format_money(standing.balance)}")
-    payments = ledger.payments_for(cycle.id)
+    payments = ledger.payments_for(cycle.id, through=standing.as_of)
     if payments:
         lines.append("  Payments:")
         for payment in payments:
