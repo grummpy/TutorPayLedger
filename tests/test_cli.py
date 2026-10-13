@@ -240,6 +240,40 @@ def test_log_payment_updates_balance_and_refuses_account_numbers(tmp_path: Path,
     assert ledger.read_text(encoding="utf-8") == before
 
 
+def test_payment_correction_preview_then_undo_keeps_the_original_payment(tmp_path: Path, capsys):
+    ledger = _seed(tmp_path)
+    capsys.readouterr()
+    before = ledger.read_bytes()
+    common = [
+        "--ledger", str(ledger), "correct-payment", "--payment", "pay_cj_sep_block",
+        "--amount", "200.00", "--date", "2026-10-05", "--reason", "Synthetic amount correction.",
+        "--id", "cor_cj_math",
+    ]
+    assert main([*common, "--preview"]) == 0
+    preview = capsys.readouterr().out
+    assert "Balance effect: +$40.00" in preview
+    assert ledger.read_bytes() == before
+
+    assert main(common) == 0
+    recorded = capsys.readouterr().out
+    assert "Recorded correction cor_cj_math" in recorded
+    assert main(["--ledger", str(ledger), "status", "--as-of", "2026-10-05"]) == 0
+    assert "Balance:      $340.00" in capsys.readouterr().out
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert saved["payments"][0]["amount"] == "240.00"
+    assert saved["corrections"][0]["reason"] == "Synthetic amount correction."
+
+    undo = [
+        "--ledger", str(ledger), "undo-correction", "--correction", "cor_cj_math",
+        "--date", "2026-10-06", "--reason", "Synthetic correction undo.", "--id", "rev_cj_math",
+    ]
+    assert main([*undo, "--preview"]) == 0
+    assert "Balance effect: -$40.00" in capsys.readouterr().out
+    assert main(undo) == 0
+    assert main(["--ledger", str(ledger), "status", "--as-of", "2026-10-06"]) == 0
+    assert "Balance:      $300.00" in capsys.readouterr().out
+
+
 def test_add_or_payment_calendar_failure_never_writes_a_partial_ledger(tmp_path: Path, capsys):
     new_ledger = tmp_path / "new-ledger.json"
     add = main(

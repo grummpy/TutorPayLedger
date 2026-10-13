@@ -13,7 +13,13 @@ try:
 except ImportError:  # pragma: no cover - the supported local test runner is POSIX.
     fcntl = None
 
-from tutor_pay_ledger.ledger import Ledger, PayCycle, Payment
+from tutor_pay_ledger.ledger import (
+    CorrectionReversal,
+    Ledger,
+    PayCycle,
+    Payment,
+    PaymentCorrection,
+)
 from tutor_pay_ledger.models import HalfDayPolicy, LedgerError, WeekendEndPolicy, parse_money
 
 VERSION = 1
@@ -52,9 +58,18 @@ def load_ledger(path: Path) -> Ledger:
     try:
         cycles = [_cycle_from_json(item) for item in payload.get("cycles", [])]
         payments = [_payment_from_json(item) for item in payload.get("payments", [])]
+        corrections = [_correction_from_json(item) for item in payload.get("corrections", [])]
+        reversals = [_reversal_from_json(item) for item in payload.get("correction_reversals", [])]
     except (KeyError, TypeError, ValueError) as exc:
         raise LedgerError(f"Ledger file is missing fields: {path}") from exc
-    return Ledger(cycles=cycles, payments=payments)
+    ledger = Ledger(
+        cycles=cycles,
+        payments=payments,
+        corrections=corrections,
+        correction_reversals=reversals,
+    )
+    _validate_history(ledger)
+    return ledger
 
 
 def save_ledger(path: Path, ledger: Ledger) -> None:
@@ -74,6 +89,10 @@ def _to_json(ledger: Ledger) -> dict:
         "version": VERSION,
         "cycles": [_cycle_to_json(cycle) for cycle in ledger.cycles],
         "payments": [_payment_to_json(payment) for payment in ledger.payments],
+        "corrections": [_correction_to_json(correction) for correction in ledger.corrections],
+        "correction_reversals": [
+            _reversal_to_json(reversal) for reversal in ledger.correction_reversals
+        ],
     }
 
 
@@ -108,6 +127,26 @@ def _payment_to_json(payment: Payment) -> dict:
     }
 
 
+def _correction_to_json(correction: PaymentCorrection) -> dict:
+    return {
+        "id": correction.id,
+        "payment_id": correction.payment_id,
+        "cycle_id": correction.cycle_id,
+        "corrected_amount": f"{correction.corrected_amount:.2f}",
+        "corrected_on": correction.corrected_on.isoformat(),
+        "reason": correction.reason,
+    }
+
+
+def _reversal_to_json(reversal: CorrectionReversal) -> dict:
+    return {
+        "id": reversal.id,
+        "correction_id": reversal.correction_id,
+        "reversed_on": reversal.reversed_on.isoformat(),
+        "reason": reversal.reason,
+    }
+
+
 def _cycle_from_json(item: dict) -> PayCycle:
     named = item["named_end"]
     quoted = item["quoted_amount"]
@@ -139,6 +178,62 @@ def _payment_from_json(item: dict) -> Payment:
         method=item["method"],
         memo=item.get("memo") or "",
     )
+
+
+def _correction_from_json(item: dict) -> PaymentCorrection:
+    return PaymentCorrection(
+        id=item["id"],
+        payment_id=item["payment_id"],
+        cycle_id=item["cycle_id"],
+        corrected_amount=parse_money(item["corrected_amount"]),
+        corrected_on=date.fromisoformat(item["corrected_on"]),
+        reason=item["reason"],
+    )
+
+
+def _reversal_from_json(item: dict) -> CorrectionReversal:
+    return CorrectionReversal(
+        id=item["id"],
+        correction_id=item["correction_id"],
+        reversed_on=date.fromisoformat(item["reversed_on"]),
+        reason=item["reason"],
+    )
+
+
+def _validate_history(ledger: Ledger) -> None:
+    correction_ids: set[str] = set()
+    for correction in ledger.corrections:
+        if correction.id in correction_ids:
+            raise LedgerError(f"Duplicate payment correction id {correction.id!r}.")
+        correction_ids.add(correction.id)
+        payment = ledger.payment(correction.payment_id)
+        if payment.cycle_id != correction.cycle_id:
+            raise LedgerError("A payment correction must keep the original payment's cycle.")
+        if correction.corrected_on < payment.paid_on:
+            raise LedgerError("A payment cannot be corrected before it was recorded.")
+
+    reversed_ids: set[str] = set()
+    reversal_ids: set[str] = set()
+    for reversal in ledger.correction_reversals:
+        if reversal.id in reversal_ids:
+            raise LedgerError(f"Duplicate correction reversal id {reversal.id!r}.")
+        if reversal.correction_id in reversed_ids:
+            raise LedgerError(f"Correction {reversal.correction_id!r} is already reversed.")
+        correction = ledger.correction(reversal.correction_id)
+        if reversal.reversed_on < correction.corrected_on:
+            raise LedgerError("A correction cannot be undone before it was recorded.")
+        reversal_ids.add(reversal.id)
+        reversed_ids.add(reversal.correction_id)
+
+    active_payments: set[str] = set()
+    for correction in ledger.corrections:
+        if correction.id in reversed_ids:
+            continue
+        if correction.payment_id in active_payments:
+            raise LedgerError(
+                f"Payment {correction.payment_id!r} has more than one active correction."
+            )
+        active_payments.add(correction.payment_id)
 
 
 def _clock(value: str) -> time:

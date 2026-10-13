@@ -30,6 +30,8 @@ from tutor_pay_ledger.calendars.updates import (
     ManualRevisionHook,
     NullCalendarUpdateHook,
     apply_revision,
+    load_revision,
+    preview_revision,
 )
 
 __all__ = [
@@ -50,6 +52,8 @@ __all__ = [
     "SchoolDay",
     "apply_revision",
     "build_sample_district_calendar",
+    "load_revision",
     "parse_ics",
+    "preview_revision",
     "read_sample_ics",
 ]
