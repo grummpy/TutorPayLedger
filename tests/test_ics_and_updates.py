@@ -5,16 +5,21 @@ from decimal import Decimal
 
 from tutor_pay_ledger.calendars.base import MemoryCalendar, SchoolDay
 from tutor_pay_ledger.calendars.fixture import build_sample_district_calendar
-from tutor_pay_ledger.calendars.ics import parse_ics, read_sample_ics
+import json
+
+import pytest
+
+from tutor_pay_ledger.calendars.ics import IcsFileProvider, parse_ics, read_sample_ics
 from tutor_pay_ledger.calendars.updates import (
     CalendarRevision,
     ManualRevisionHook,
     NullCalendarUpdateHook,
     apply_revision,
+    preview_revision,
 )
 from tutor_pay_ledger.coverage import session_weight
 from tutor_pay_ledger.ledger import project
-from tutor_pay_ledger.models import DayKind, HalfDayPolicy
+from tutor_pay_ledger.models import DayKind, HalfDayPolicy, LedgerError
 from tutor_pay_ledger.seed import build_seed_ledger
 
 WEEKDAYS = frozenset({0, 1, 2, 3, 4})
@@ -69,6 +74,36 @@ def test_sample_fragment_matches_the_fixture_inside_the_seed_window():
     assert fixture.describe(date(2026, 7, 6)).kind == DayKind.BREAK
 
 
+def test_local_ics_coverage_requires_an_explicit_policy_and_does_not_bill_summer(tmp_path):
+    source = tmp_path / "district.ics"
+    source.write_text(
+        "BEGIN:VCALENDAR\nBEGIN:VEVENT\nDTSTART;VALUE=DATE:20261012\n"
+        "SUMMARY:Holiday\nEND:VEVENT\nEND:VCALENDAR\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(LedgerError, match="effective start, effective end, and out-of-coverage"):
+        IcsFileProvider(source).load()
+
+    calendar = IcsFileProvider(
+        source,
+        effective_from=date(2026, 8, 24),
+        effective_through=date(2027, 6, 11),
+        out_of_coverage="closed",
+    ).load()
+    summer = calendar.describe(date(2026, 7, 6))
+    assert summer.kind == DayKind.BREAK
+    assert summer.name == "Outside declared ICS coverage"
+
+    error_calendar = IcsFileProvider(
+        source,
+        effective_from=date(2026, 8, 24),
+        effective_through=date(2027, 6, 11),
+        out_of_coverage="error",
+    ).load()
+    with pytest.raises(LedgerError, match="outside its declared coverage"):
+        error_calendar.describe(date(2026, 7, 6))
+
+
 def test_null_hook_is_a_noop_and_a_manual_revision_can_close_a_day():
     assert NullCalendarUpdateHook().poll() is None
     revision = CalendarRevision(
@@ -95,3 +130,46 @@ def test_null_hook_is_a_noop_and_a_manual_revision_can_close_a_day():
     )
     overlaid = apply_revision(MemoryCalendar(), weekend_revision)
     assert overlaid.describe(date(2026, 10, 17)).kind == DayKind.WEEKEND
+
+
+def test_revision_preview_is_reproducible_and_keeps_payments_historical(tmp_path):
+    ledger = build_seed_ledger()
+    cycle = ledger.cycles[0]
+    revision_path = tmp_path / "snow-day.json"
+    revision_path.write_text(
+        json.dumps(
+            {
+                "source_name": "manual district export",
+                "observed_on": "2026-10-10",
+                "summary": "Oct 15 changed to a snow day.",
+                "overrides": [
+                    {"date": "2026-10-15", "kind": "holiday", "name": "Snow day"},
+                    {"date": "2026-10-17", "kind": "in_session", "name": "Ignored Saturday"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    from tutor_pay_ledger.calendars.updates import load_revision
+
+    preview = preview_revision(
+        cycle,
+        build_sample_district_calendar(),
+        load_revision(revision_path),
+        date(2026, 10, 5),
+        ledger.payments,
+    )
+    assert preview.before.total_units == Decimal("13.5")
+    assert preview.after.total_units == Decimal("12.5")
+    # The quoted agreement remains unchanged; the preview reports the
+    # calendar-derived scheduled value separately.
+    assert preview.before.agreed_amount == preview.after.agreed_amount == Decimal("540.00")
+    assert preview.scheduled_value_before == Decimal("540.00")
+    assert preview.scheduled_value_after == Decimal("500.00")
+    assert preview.before.paid == preview.after.paid == Decimal("240.00")
+    assert preview.session_value_delta == Decimal("-40.00")
+    changed = {entry.day: entry for entry in preview.changed_days}
+    assert changed[date(2026, 10, 15)].before.kind == DayKind.IN_SESSION
+    assert changed[date(2026, 10, 15)].after.kind == DayKind.HOLIDAY
+    assert changed[date(2026, 10, 17)].after.kind == DayKind.WEEKEND
+    assert ledger.payments[0].amount == Decimal("240.00")

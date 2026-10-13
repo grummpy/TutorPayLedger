@@ -81,6 +81,20 @@ tutor-ledger log-payment \
   --memo "October top-up"
 ```
 
+If a recorded amount needs correcting, the original payment is never edited or
+deleted. First inspect the balance effect, then record an auditable correction
+or an equally auditable undo. These examples use synthetic sample data only.
+
+```bash
+tutor-ledger --ledger data/ledger.json correct-payment \
+  --payment pay_cj_sep_block --amount 200.00 --date 2026-10-05 \
+  --reason "Amount entered too high" --preview
+
+tutor-ledger --ledger data/ledger.json undo-correction \
+  --correction cor_example --date 2026-10-06 \
+  --reason "Undo sample correction" --preview
+```
+
 The Saturday end date rolls through Monday 19 October 2026. `--amount` on `add-cycle` is optional; when you omit it, the agreed price is the session rate times billable units in the window (half-days at half rate).
 
 `extend-note` only prints a draft. It does not change the ledger and it does not ask anyone for payment details.
@@ -127,17 +141,23 @@ Indigenous Peoples' Day, Monday 12 October 2026, is inside the window and is not
 
 - **`fixture`** (default) — Sample District 2026–27, a fictional US school year in `tutor_pay_ledger.calendars.fixture`. First day Monday 24 August 2026, last day Friday 11 June 2027 (a half-day). Includes Labor Day, Indigenous Peoples' Day, Veterans Day, Thanksgiving recess, winter break, Martin Luther King Jr. Day, Presidents Day, spring break, Good Friday, Memorial Day, and three half-days (16 October 2026, 18 December 2026, 11 June 2027). This is not a real district's calendar.
 - **`sample-ics`** — a short ICS fragment shipped at `src/tutor_pay_ledger/data/sample_district.ics`. Same October closures as the fixture, plus Thanksgiving recess. Offline.
-- **`ics`** — `--ics path/to/school.ics` reads a file you already have. It does not download a URL. All-day events become closures. `CATEGORIES` of `HALF-DAY` / `EARLY-RELEASE` (or a summary that says "half" or "early release") become half-days. `BREAK`, `VACATION`, `RECESS`, or a summary that says "break" or "recess", become breaks. Other all-day events are holidays. `DTEND;VALUE=DATE` is exclusive. Timed events are ignored. A later event in the file wins on the same date.
+- **`ics`** — `--ics path/to/school.ics` reads a file you already have. It does not download a URL. Local ICS use also requires `--ics-effective-from YYYY-MM-DD`, `--ics-effective-through YYYY-MM-DD`, and `--ics-out-of-coverage closed|error`: outside that declared range it either reports a break or refuses the projection, rather than silently treating an ordinary weekday as covered. Within the declared range, all-day events become closures. `CATEGORIES` of `HALF-DAY` / `EARLY-RELEASE` (or a summary that says "half" or "early release") become half-days. `BREAK`, `VACATION`, `RECESS`, or a summary that says "break" or "recess", become breaks. Other all-day events are holidays. `DTEND;VALUE=DATE` is exclusive. Timed events are ignored. A later event in the file wins on the same date.
 
 **Update hook.** `CalendarUpdateHook.poll()` is the seam for a bot that watches a school site, an ICS URL, or an inbox drop. `NullCalendarUpdateHook` is the default stub: it returns nothing and never opens a network connection. `ManualRevisionHook` holds one `CalendarRevision` for a test or a hand-applied change. `apply_revision` overlays those days onto a calendar. Weekend overrides still cannot create a Saturday session.
 
 Wire a bot by implementing `poll`, pointing it at a local export, and passing the revision through `apply_revision` before you project a cycle. Keep the fetch outside this library so tests stay offline.
 
+Use `preview-revision --cycle ID --revision local-revision.json` to compare
+the local source before accepting anything. The JSON contains `source_name`,
+`observed_on`, `summary`, and an `overrides` array of `{date, kind, name}`
+objects. Preview lists requested dates, session units, scheduled value, and
+unchanged recorded payments; it does not write the calendar or ledger.
+
 ## Layout
 
 ```
 src/tutor_pay_ledger/
-  cli.py            add-cycle, log-payment, status, sessions, extend-note, seed, calendar
+  cli.py            add-cycle, log-payment, correct-payment, undo-correction, preview-revision, status, sessions, extend-note, seed, calendar
   coverage.py       weekday walk, half-day policy, weekend-end rule, 7-day warning
   ledger.py         cycles, payments, standing
   notes.py          extend-by-N draft
