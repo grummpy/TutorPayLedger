@@ -2,14 +2,42 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from datetime import date, time
 from pathlib import Path
+from typing import Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the supported local test runner is POSIX.
+    fcntl = None
 
 from tutor_pay_ledger.ledger import Ledger, PayCycle, Payment
 from tutor_pay_ledger.models import HalfDayPolicy, LedgerError, WeekendEndPolicy, parse_money
 
 VERSION = 1
+
+
+@contextmanager
+def locked_ledger(path: Path) -> Iterator[None]:
+    """Serialize one local ledger's read-modify-write transaction.
+
+    The sidecar is intentionally retained: deleting it after releasing an
+    advisory lock can create a second inode while another process is waiting.
+    The lock itself is released automatically if a process exits unexpectedly.
+    """
+
+    if fcntl is None:
+        raise LedgerError("Concurrent ledger updates require a POSIX local filesystem.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def load_ledger(path: Path) -> Ledger:

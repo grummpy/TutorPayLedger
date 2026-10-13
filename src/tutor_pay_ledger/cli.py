@@ -38,7 +38,7 @@ from tutor_pay_ledger.models import (
 )
 from tutor_pay_ledger.notes import draft_extend_note
 from tutor_pay_ledger.seed import build_seed_ledger
-from tutor_pay_ledger.store import empty_ledger, load_ledger, save_ledger
+from tutor_pay_ledger.store import empty_ledger, load_ledger, locked_ledger, save_ledger
 
 _HALF = Decimal("0.5")
 
@@ -188,9 +188,10 @@ def cmd_add_cycle(args: argparse.Namespace) -> int:
     # A missing local ICS file must not leave a cycle behind for a retry.
     calendar = _calendar(args)
     standing = project(cycle, calendar, _as_of(args), [])
-    ledger = empty_ledger() if not path.exists() else load_ledger(path)
-    ledger.add_cycle(cycle)
-    save_ledger(path, ledger)
+    with locked_ledger(path):
+        ledger = empty_ledger() if not path.exists() else load_ledger(path)
+        ledger.add_cycle(cycle)
+        save_ledger(path, ledger)
     who = f" for {cycle.beneficiary}" if cycle.beneficiary else ""
     print(f"Added {cycle.id}")
     print(f"  {cycle.service}{who}")
@@ -209,7 +210,6 @@ def cmd_add_cycle(args: argparse.Namespace) -> int:
 
 def cmd_log_payment(args: argparse.Namespace) -> int:
     path = Path(args.ledger)
-    ledger = load_ledger(path)
     payment = Payment(
         id=args.id or _new_id("pay"),
         cycle_id=args.cycle,
@@ -218,14 +218,16 @@ def cmd_log_payment(args: argparse.Namespace) -> int:
         method=args.method,
         memo=args.memo,
     )
-    cycle = ledger.cycle(payment.cycle_id)
-    # Validate projection against the proposed state before writing. This keeps
-    # save_ledger's atomic replacement while avoiding partial commands.
     calendar = _calendar(args)
-    proposed_payments = [*ledger.payments_for(payment.cycle_id), payment]
-    standing = project(cycle, calendar, payment.paid_on, proposed_payments)
-    ledger.log_payment(payment)
-    save_ledger(path, ledger)
+    with locked_ledger(path):
+        ledger = load_ledger(path)
+        cycle = ledger.cycle(payment.cycle_id)
+        # Validate projection against the proposed state before writing. This keeps
+        # save_ledger's atomic replacement while avoiding partial commands.
+        proposed_payments = [*ledger.payments_for(payment.cycle_id), payment]
+        standing = project(cycle, calendar, payment.paid_on, proposed_payments)
+        ledger.log_payment(payment)
+        save_ledger(path, ledger)
     print(
         f"Recorded {payment.id}: {format_money(payment.amount)} "
         f"on {payment.paid_on.isoformat()} ({payment.method})"
@@ -312,9 +314,10 @@ def cmd_extend_note(args: argparse.Namespace) -> int:
 
 def cmd_seed(args: argparse.Namespace) -> int:
     path = Path(args.ledger)
-    if path.exists() and not args.force:
-        raise LedgerError(f"{path} already exists. Pass --force to replace it.")
-    save_ledger(path, build_seed_ledger())
+    with locked_ledger(path):
+        if path.exists() and not args.force:
+            raise LedgerError(f"{path} already exists. Pass --force to replace it.")
+        save_ledger(path, build_seed_ledger())
     print(f"Wrote sample ledger to {path}")
     print("  Payee: Personal school tutor")
     print("  For: CJ")

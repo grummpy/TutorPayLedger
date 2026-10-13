@@ -1,12 +1,16 @@
 """CLI flows against a temporary ledger. No network and no shared data file."""
 
 import json
+import os
 import subprocess
 import sys
+import textwrap
+import time
 from pathlib import Path
 
 from tutor_pay_ledger.cli import main
 from tutor_pay_ledger.seed import SEED_CYCLE_ID
+from tutor_pay_ledger.store import locked_ledger
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,11 +36,45 @@ def test_module_help_runs_offline():
 
 
 def _env() -> dict[str, str]:
-    import os
-
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
     return env
+
+
+def test_concurrent_synthetic_updates_preserve_both_payments(tmp_path: Path):
+    """Two independently opened synthetic ledgers serialize their updates."""
+
+    ledger = _seed(tmp_path)
+    worker = textwrap.dedent("""\
+        from tutor_pay_ledger.cli import main
+        import sys
+
+        raise SystemExit(main([
+            "--ledger", sys.argv[1], "log-payment",
+            "--cycle", "cyc_cj_math_2026oct",
+            "--amount", "10.00", "--date", "2026-10-05",
+            "--method", "cash", "--id", sys.argv[2],
+        ]))
+    """)
+    commands = [
+        [sys.executable, "-c", worker, str(ledger), payment_id]
+        for payment_id in ("pay_concurrent_a", "pay_concurrent_b")
+    ]
+    with locked_ledger(ledger):
+        first = subprocess.Popen(commands[0], cwd=ROOT, env=_env())
+        second = subprocess.Popen(commands[1], cwd=ROOT, env=_env())
+        time.sleep(0.1)
+        assert first.poll() is None
+        assert second.poll() is None
+    assert first.wait(timeout=5) == 0
+    assert second.wait(timeout=5) == 0
+
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert {payment["id"] for payment in saved["payments"]} >= {
+        "pay_concurrent_a",
+        "pay_concurrent_b",
+    }
+    assert not ledger.with_suffix(ledger.suffix + ".tmp").exists()
 
 
 def test_status_sessions_warning_and_extend_note(tmp_path: Path, capsys):
