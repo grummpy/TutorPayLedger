@@ -9,10 +9,15 @@ call the network on your behalf.
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
+from pathlib import Path
 from typing import Protocol
 
 from tutor_pay_ledger.calendars.base import OverlayCalendar, SchoolCalendar, SchoolDay
+from tutor_pay_ledger.models import DayKind, LedgerError
 
 
 class CalendarRevision:
@@ -83,3 +88,114 @@ def apply_revision(calendar: SchoolCalendar, revision: CalendarRevision) -> Over
 
     overrides = {item.day: item for item in revision.overrides}
     return OverlayCalendar(calendar, overrides)
+
+
+@dataclass(frozen=True)
+class RevisionDayChange:
+    """One requested revision day and its actual before/after classification."""
+
+    day: date
+    before: SchoolDay
+    after: SchoolDay
+    session_value_before: Decimal
+    session_value_after: Decimal
+
+
+@dataclass(frozen=True)
+class RevisionPreview:
+    """A non-mutating coverage and value comparison for one revision."""
+
+    revision: CalendarRevision
+    before: object
+    after: object
+    changed_days: tuple[RevisionDayChange, ...]
+    scheduled_value_before: Decimal
+    scheduled_value_after: Decimal
+
+    @property
+    def session_units_delta(self) -> Decimal:
+        return self.after.total_units - self.before.total_units
+
+    @property
+    def session_value_delta(self) -> Decimal:
+        return self.scheduled_value_after - self.scheduled_value_before
+
+
+def load_revision(path: str | Path) -> CalendarRevision:
+    """Read one manually supplied, local revision JSON file.
+
+    This is deliberately a reader rather than an acceptance workflow: callers
+    can inspect a source change without persisting it or contacting a calendar
+    service.
+    """
+
+    source = Path(path)
+    if not source.is_file():
+        raise LedgerError(f"Revision file not found: {source}")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LedgerError(f"Revision file is not valid JSON: {source}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("overrides"), list):
+        raise LedgerError("Revision file needs source_name, observed_on, summary, and an overrides list.")
+    try:
+        overrides = tuple(_revision_day(item) for item in payload["overrides"])
+        observed_on = date.fromisoformat(str(payload["observed_on"]))
+        source_name = str(payload["source_name"])
+        summary = str(payload["summary"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LedgerError(f"Revision file has invalid fields: {source}") from exc
+    return CalendarRevision(
+        source_name=source_name,
+        observed_on=observed_on,
+        summary=summary,
+        overrides=overrides,
+    )
+
+
+def preview_revision(cycle, calendar: SchoolCalendar, revision: CalendarRevision, as_of: date, payments):
+    """Compare projections before and after a revision without changing either.
+
+    Payments are passed straight through to both projections.  Calendar
+    revisions therefore cannot alter recorded payment history.
+    """
+
+    # Keep imports local to avoid a calendars -> ledger import cycle.
+    from tutor_pay_ledger.ledger import project
+
+    before = project(cycle, calendar, as_of, payments)
+    updated = apply_revision(calendar, revision)
+    after = project(cycle, updated, as_of, payments)
+    before_values = {line.day: line.amount for line in before.sessions}
+    after_values = {line.day: line.amount for line in after.sessions}
+    changes = tuple(
+        RevisionDayChange(
+            day=item.day,
+            before=calendar.describe(item.day),
+            after=updated.describe(item.day),
+            session_value_before=before_values.get(item.day, Decimal("0.00")),
+            session_value_after=after_values.get(item.day, Decimal("0.00")),
+        )
+        for item in sorted(revision.overrides, key=lambda entry: entry.day)
+    )
+    scheduled_before = sum((line.amount for line in before.sessions), Decimal("0.00"))
+    scheduled_after = sum((line.amount for line in after.sessions), Decimal("0.00"))
+    return RevisionPreview(
+        revision=revision,
+        before=before,
+        after=after,
+        changed_days=changes,
+        scheduled_value_before=scheduled_before,
+        scheduled_value_after=scheduled_after,
+    )
+
+
+def _revision_day(value: object) -> SchoolDay:
+    if not isinstance(value, dict):
+        raise ValueError("override must be an object")
+    day = date.fromisoformat(str(value["date"]))
+    kind = DayKind(str(value["kind"]))
+    name_value = value.get("name")
+    if name_value is not None and not isinstance(name_value, str):
+        raise ValueError("override name must be text")
+    return SchoolDay(day, kind, name_value)

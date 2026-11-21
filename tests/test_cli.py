@@ -1,12 +1,16 @@
 """CLI flows against a temporary ledger. No network and no shared data file."""
 
 import json
+import os
 import subprocess
 import sys
+import textwrap
+import time
 from pathlib import Path
 
 from tutor_pay_ledger.cli import main
 from tutor_pay_ledger.seed import SEED_CYCLE_ID
+from tutor_pay_ledger.store import locked_ledger
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,11 +36,45 @@ def test_module_help_runs_offline():
 
 
 def _env() -> dict[str, str]:
-    import os
-
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
     return env
+
+
+def test_concurrent_synthetic_updates_preserve_both_payments(tmp_path: Path):
+    """Two independently opened synthetic ledgers serialize their updates."""
+
+    ledger = _seed(tmp_path)
+    worker = textwrap.dedent("""\
+        from tutor_pay_ledger.cli import main
+        import sys
+
+        raise SystemExit(main([
+            "--ledger", sys.argv[1], "log-payment",
+            "--cycle", "cyc_cj_math_2026oct",
+            "--amount", "10.00", "--date", "2026-10-05",
+            "--method", "cash", "--id", sys.argv[2],
+        ]))
+    """)
+    commands = [
+        [sys.executable, "-c", worker, str(ledger), payment_id]
+        for payment_id in ("pay_concurrent_a", "pay_concurrent_b")
+    ]
+    with locked_ledger(ledger):
+        first = subprocess.Popen(commands[0], cwd=ROOT, env=_env())
+        second = subprocess.Popen(commands[1], cwd=ROOT, env=_env())
+        time.sleep(0.1)
+        assert first.poll() is None
+        assert second.poll() is None
+    assert first.wait(timeout=5) == 0
+    assert second.wait(timeout=5) == 0
+
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert {payment["id"] for payment in saved["payments"]} >= {
+        "pay_concurrent_a",
+        "pay_concurrent_b",
+    }
+    assert not ledger.with_suffix(ledger.suffix + ".tmp").exists()
 
 
 def test_status_sessions_warning_and_extend_note(tmp_path: Path, capsys):
@@ -200,6 +238,40 @@ def test_log_payment_updates_balance_and_refuses_account_numbers(tmp_path: Path,
     assert refused == 1
     assert "bank credentials" in capsys.readouterr().err
     assert ledger.read_text(encoding="utf-8") == before
+
+
+def test_payment_correction_preview_then_undo_keeps_the_original_payment(tmp_path: Path, capsys):
+    ledger = _seed(tmp_path)
+    capsys.readouterr()
+    before = ledger.read_bytes()
+    common = [
+        "--ledger", str(ledger), "correct-payment", "--payment", "pay_cj_sep_block",
+        "--amount", "200.00", "--date", "2026-10-05", "--reason", "Synthetic amount correction.",
+        "--id", "cor_cj_math",
+    ]
+    assert main([*common, "--preview"]) == 0
+    preview = capsys.readouterr().out
+    assert "Balance effect: +$40.00" in preview
+    assert ledger.read_bytes() == before
+
+    assert main(common) == 0
+    recorded = capsys.readouterr().out
+    assert "Recorded correction cor_cj_math" in recorded
+    assert main(["--ledger", str(ledger), "status", "--as-of", "2026-10-05"]) == 0
+    assert "Balance:      $340.00" in capsys.readouterr().out
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert saved["payments"][0]["amount"] == "240.00"
+    assert saved["corrections"][0]["reason"] == "Synthetic amount correction."
+
+    undo = [
+        "--ledger", str(ledger), "undo-correction", "--correction", "cor_cj_math",
+        "--date", "2026-10-06", "--reason", "Synthetic correction undo.", "--id", "rev_cj_math",
+    ]
+    assert main([*undo, "--preview"]) == 0
+    assert "Balance effect: -$40.00" in capsys.readouterr().out
+    assert main(undo) == 0
+    assert main(["--ledger", str(ledger), "status", "--as-of", "2026-10-06"]) == 0
+    assert "Balance:      $300.00" in capsys.readouterr().out
 
 
 def test_add_or_payment_calendar_failure_never_writes_a_partial_ledger(tmp_path: Path, capsys):

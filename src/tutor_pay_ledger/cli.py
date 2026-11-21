@@ -22,7 +22,16 @@ from pathlib import Path
 
 from tutor_pay_ledger.calendars.fixture import FixtureCalendarProvider
 from tutor_pay_ledger.calendars.ics import IcsFileProvider, SampleIcsProvider
-from tutor_pay_ledger.ledger import PayCycle, Payment, project
+from tutor_pay_ledger.calendars.updates import load_revision, preview_revision
+from tutor_pay_ledger.ledger import (
+    CorrectionReversal,
+    PayCycle,
+    Payment,
+    PaymentCorrection,
+    preview_correction_reversal,
+    preview_payment_correction,
+    project,
+)
 from tutor_pay_ledger.models import (
     HalfDayPolicy,
     LedgerError,
@@ -38,7 +47,7 @@ from tutor_pay_ledger.models import (
 )
 from tutor_pay_ledger.notes import draft_extend_note
 from tutor_pay_ledger.seed import build_seed_ledger
-from tutor_pay_ledger.store import empty_ledger, load_ledger, save_ledger
+from tutor_pay_ledger.store import empty_ledger, load_ledger, locked_ledger, save_ledger
 
 _HALF = Decimal("0.5")
 
@@ -75,6 +84,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ics",
         help="Local ICS file. Required when --calendar ics. Never fetched over the network.",
+    )
+    parser.add_argument(
+        "--ics-effective-from",
+        type=_date_arg,
+        help="First date a local ICS file may treat an unlisted weekday as in session.",
+    )
+    parser.add_argument(
+        "--ics-effective-through",
+        type=_date_arg,
+        help="Last date a local ICS file may treat an unlisted weekday as in session.",
+    )
+    parser.add_argument(
+        "--ics-out-of-coverage",
+        choices=("closed", "error"),
+        help="Required with --calendar ics: close or reject dates outside declared coverage.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -125,6 +149,29 @@ def build_parser() -> argparse.ArgumentParser:
     pay.add_argument("--id", help="Optional payment id.")
     pay.set_defaults(handler=cmd_log_payment)
 
+    correct = sub.add_parser(
+        "correct-payment",
+        help="Preview or record a reversible correction without editing the original payment.",
+    )
+    correct.add_argument("--payment", required=True, help="Recorded payment id to correct.")
+    correct.add_argument("--amount", required=True, help="Corrected payment amount, including 0.00.")
+    correct.add_argument("--date", required=True, type=_date_arg, help="Correction record date.")
+    correct.add_argument("--reason", required=True, help="Short explanation; do not include account numbers.")
+    correct.add_argument("--id", help="Optional correction id.")
+    correct.add_argument("--preview", action="store_true", help="Show the balance effect without writing.")
+    correct.set_defaults(handler=cmd_correct_payment)
+
+    undo = sub.add_parser(
+        "undo-correction",
+        help="Preview or record an immutable undo for a payment correction.",
+    )
+    undo.add_argument("--correction", required=True, help="Correction id to undo.")
+    undo.add_argument("--date", required=True, type=_date_arg, help="Undo record date.")
+    undo.add_argument("--reason", required=True, help="Short explanation; do not include account numbers.")
+    undo.add_argument("--id", help="Optional undo id.")
+    undo.add_argument("--preview", action="store_true", help="Show the balance effect without writing.")
+    undo.set_defaults(handler=cmd_undo_correction)
+
     status = sub.add_parser("status", help="Show cycles, remaining sessions, and 7-day warnings.")
     status.add_argument("--as-of", type=_date_arg, default=None, help="YYYY-MM-DD. Default: today.")
     status.add_argument(
@@ -149,6 +196,15 @@ def build_parser() -> argparse.ArgumentParser:
     note.add_argument("--days", required=True, type=_count_arg, help="School weekdays to add.")
     note.add_argument("--as-of", type=_date_arg, default=None)
     note.set_defaults(handler=cmd_extend_note)
+
+    revision = sub.add_parser(
+        "preview-revision",
+        help="Compare one local calendar revision without accepting or saving it.",
+    )
+    revision.add_argument("--cycle", required=True)
+    revision.add_argument("--revision", required=True, help="Local revision JSON file.")
+    revision.add_argument("--as-of", type=_date_arg, default=None)
+    revision.set_defaults(handler=cmd_preview_revision)
 
     seed = sub.add_parser("seed", help="Write the sample tutor cycle used in demos and tests.")
     seed.add_argument("--force", action="store_true", help="Replace an existing ledger file.")
@@ -188,9 +244,10 @@ def cmd_add_cycle(args: argparse.Namespace) -> int:
     # A missing local ICS file must not leave a cycle behind for a retry.
     calendar = _calendar(args)
     standing = project(cycle, calendar, _as_of(args), [])
-    ledger = empty_ledger() if not path.exists() else load_ledger(path)
-    ledger.add_cycle(cycle)
-    save_ledger(path, ledger)
+    with locked_ledger(path):
+        ledger = empty_ledger() if not path.exists() else load_ledger(path)
+        ledger.add_cycle(cycle)
+        save_ledger(path, ledger)
     who = f" for {cycle.beneficiary}" if cycle.beneficiary else ""
     print(f"Added {cycle.id}")
     print(f"  {cycle.service}{who}")
@@ -209,7 +266,6 @@ def cmd_add_cycle(args: argparse.Namespace) -> int:
 
 def cmd_log_payment(args: argparse.Namespace) -> int:
     path = Path(args.ledger)
-    ledger = load_ledger(path)
     payment = Payment(
         id=args.id or _new_id("pay"),
         cycle_id=args.cycle,
@@ -218,19 +274,73 @@ def cmd_log_payment(args: argparse.Namespace) -> int:
         method=args.method,
         memo=args.memo,
     )
-    cycle = ledger.cycle(payment.cycle_id)
-    # Validate projection against the proposed state before writing. This keeps
-    # save_ledger's atomic replacement while avoiding partial commands.
     calendar = _calendar(args)
-    proposed_payments = [*ledger.payments_for(payment.cycle_id), payment]
-    standing = project(cycle, calendar, payment.paid_on, proposed_payments)
-    ledger.log_payment(payment)
-    save_ledger(path, ledger)
+    with locked_ledger(path):
+        ledger = load_ledger(path)
+        cycle = ledger.cycle(payment.cycle_id)
+        # Validate projection against the proposed state before writing. This keeps
+        # save_ledger's atomic replacement while avoiding partial commands.
+        proposed_payments = [
+            *ledger.effective_payments_for(payment.cycle_id, through=payment.paid_on),
+            payment,
+        ]
+        standing = project(cycle, calendar, payment.paid_on, proposed_payments)
+        ledger.log_payment(payment)
+        save_ledger(path, ledger)
     print(
         f"Recorded {payment.id}: {format_money(payment.amount)} "
         f"on {payment.paid_on.isoformat()} ({payment.method})"
     )
     print(f"  Balance on {payment.cycle_id}: {format_money(standing.balance)}")
+    return 0
+
+
+def cmd_correct_payment(args: argparse.Namespace) -> int:
+    path = Path(args.ledger)
+    calendar = _calendar(args)
+    with locked_ledger(path):
+        ledger = load_ledger(path)
+        original = ledger.payment(args.payment)
+        correction = PaymentCorrection(
+            id=args.id or _new_id("cor"),
+            payment_id=original.id,
+            cycle_id=original.cycle_id,
+            corrected_amount=parse_money(args.amount),
+            corrected_on=args.date,
+            reason=args.reason,
+        )
+        preview = preview_payment_correction(ledger, correction, calendar)
+        if not args.preview:
+            ledger.add_correction(correction)
+            save_ledger(path, ledger)
+    _render_correction_preview(preview, label="Correction")
+    if args.preview:
+        print("Preview only; no ledger changes were written.")
+    else:
+        print(f"Recorded correction {correction.id}; original payment {original.id} is retained.")
+    return 0
+
+
+def cmd_undo_correction(args: argparse.Namespace) -> int:
+    path = Path(args.ledger)
+    calendar = _calendar(args)
+    with locked_ledger(path):
+        ledger = load_ledger(path)
+        reversal = CorrectionReversal(
+            id=args.id or _new_id("rev"),
+            correction_id=args.correction,
+            reversed_on=args.date,
+            reason=args.reason,
+        )
+        preview = preview_correction_reversal(ledger, reversal, calendar)
+        if not args.preview:
+            ledger.add_correction_reversal(reversal)
+            save_ledger(path, ledger)
+    _render_correction_preview(preview, label="Correction undo")
+    if args.preview:
+        print("Preview only; no ledger changes were written.")
+    else:
+        print(f"Recorded correction undo {reversal.id}; correction {reversal.correction_id} is retained.")
     return 0
 
 
@@ -246,7 +356,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
     warned = False
     standings = [
-        project(cycle, calendar, as_of, ledger.payments_for(cycle.id)) for cycle in ledger.cycles
+        project(
+            cycle,
+            calendar,
+            as_of,
+            ledger.effective_payments_for(cycle.id, through=as_of),
+        )
+        for cycle in ledger.cycles
     ]
     standings.sort(key=lambda item: (item.effective_end, item.cycle.id))
     for standing in standings:
@@ -262,7 +378,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_sessions(args: argparse.Namespace) -> int:
     ledger = load_ledger(Path(args.ledger))
     cycle = ledger.cycle(args.cycle)
-    standing = project(cycle, _calendar(args), _as_of(args), ledger.payments_for(cycle.id))
+    as_of = _as_of(args)
+    standing = project(
+        cycle,
+        _calendar(args),
+        as_of,
+        ledger.effective_payments_for(cycle.id, through=as_of),
+    )
     rows = standing.sessions if args.all else standing.remaining
     who = f", {cycle.beneficiary}" if cycle.beneficiary else ""
     scope = "Sessions" if args.all else "Remaining sessions"
@@ -305,16 +427,38 @@ def cmd_extend_note(args: argparse.Namespace) -> int:
     ledger = load_ledger(Path(args.ledger))
     cycle = ledger.cycle(args.cycle)
     calendar = _calendar(args)
-    standing = project(cycle, calendar, _as_of(args), ledger.payments_for(cycle.id))
+    as_of = _as_of(args)
+    standing = project(
+        cycle,
+        calendar,
+        as_of,
+        ledger.effective_payments_for(cycle.id, through=as_of),
+    )
     sys.stdout.write(draft_extend_note(cycle, calendar, args.days, standing))
+    return 0
+
+
+def cmd_preview_revision(args: argparse.Namespace) -> int:
+    ledger = load_ledger(Path(args.ledger))
+    cycle = ledger.cycle(args.cycle)
+    as_of = _as_of(args)
+    preview = preview_revision(
+        cycle,
+        _calendar(args),
+        load_revision(args.revision),
+        as_of,
+        ledger.effective_payments_for(cycle.id, through=as_of),
+    )
+    _render_revision_preview(preview)
     return 0
 
 
 def cmd_seed(args: argparse.Namespace) -> int:
     path = Path(args.ledger)
-    if path.exists() and not args.force:
-        raise LedgerError(f"{path} already exists. Pass --force to replace it.")
-    save_ledger(path, build_seed_ledger())
+    with locked_ledger(path):
+        if path.exists() and not args.force:
+            raise LedgerError(f"{path} already exists. Pass --force to replace it.")
+        save_ledger(path, build_seed_ledger())
     print(f"Wrote sample ledger to {path}")
     print("  Payee: Personal school tutor")
     print("  For: CJ")
@@ -353,6 +497,46 @@ def cmd_calendar(args: argparse.Namespace) -> int:
     return 0
 
 
+def _render_correction_preview(preview, *, label: str) -> None:
+    delta = preview.balance_delta
+    sign = "+" if delta >= 0 else ""
+    print(f"{label} preview")
+    print(f"  Balance before: {format_money(preview.before.balance)}")
+    print(f"  Balance after:  {format_money(preview.after.balance)}")
+    print(f"  Balance effect: {sign}{format_money(delta)}")
+
+
+def _render_revision_preview(preview) -> None:
+    before = preview.before
+    after = preview.after
+    print(f"Calendar revision preview for {before.cycle.id}")
+    print(f"  Source: {preview.revision.source_name}")
+    print(f"  Summary: {preview.revision.summary}")
+    print("  Requested dates:")
+    for change in preview.changed_days:
+        print(
+            f"    {change.day.isoformat()}  {change.before.kind.value} -> "
+            f"{change.after.kind.value}; scheduled value "
+            f"{format_money(change.session_value_before)} -> "
+            f"{format_money(change.session_value_after)}"
+        )
+    value_sign = "+" if preview.session_value_delta >= 0 else ""
+    print(
+        f"  Sessions: {format_units(before.total_units)} -> "
+        f"{format_units(after.total_units)}"
+    )
+    print(
+        f"  Scheduled value: {format_money(preview.scheduled_value_before)} -> "
+        f"{format_money(preview.scheduled_value_after)} "
+        f"({value_sign}{format_money(preview.session_value_delta)})"
+    )
+    print(
+        f"  Recorded payments unchanged: {format_money(before.paid)} -> "
+        f"{format_money(after.paid)}"
+    )
+    print("Preview only; no calendar or ledger changes were written.")
+
+
 def _render_cycle(standing, ledger) -> str:
     cycle = standing.cycle
     lines = [cycle.id, f"  Service:      {cycle.service}"]
@@ -387,6 +571,30 @@ def _render_cycle(standing, ledger) -> str:
                 f"    {payment.paid_on.isoformat()}  {format_money(payment.amount)}  "
                 f"{payment.method}{memo}"
             )
+    corrections = [
+        correction
+        for correction in ledger.corrections
+        if correction.cycle_id == cycle.id and correction.corrected_on <= standing.as_of
+    ]
+    if corrections:
+        lines.append("  Payment corrections:")
+        reversal_dates = {
+            reversal.correction_id: reversal.reversed_on
+            for reversal in ledger.correction_reversals
+            if reversal.reversed_on <= standing.as_of
+        }
+        for correction in corrections:
+            state = "reversed" if correction.id in reversal_dates else "active"
+            original = ledger.payment(correction.payment_id)
+            details = (
+                f"    {correction.corrected_on.isoformat()}  {correction.id}  "
+                f"{original.id}: {format_money(original.amount)} -> "
+                f"{format_money(correction.corrected_amount)}  {state}"
+            )
+            lines.append(details)
+            lines.append(f"      Reason: {correction.reason}")
+            if correction.id in reversal_dates:
+                lines.append(f"      Reversed on: {reversal_dates[correction.id].isoformat()}")
     if standing.warning:
         lines.append(f"  WARNING:      {standing.warning}")
     elif standing.state == "ended":
@@ -416,7 +624,21 @@ def _calendar(args: argparse.Namespace):
         return SampleIcsProvider().load()
     if not args.ics:
         raise LedgerError("Pass --ics PATH when --calendar is ics. The feed is read from disk only.")
-    return IcsFileProvider(args.ics).load()
+    if (
+        args.ics_effective_from is None
+        or args.ics_effective_through is None
+        or args.ics_out_of_coverage is None
+    ):
+        raise LedgerError(
+            "Local ICS configuration requires --ics-effective-from, --ics-effective-through, "
+            "and --ics-out-of-coverage (closed or error)."
+        )
+    return IcsFileProvider(
+        args.ics,
+        effective_from=args.ics_effective_from,
+        effective_through=args.ics_effective_through,
+        out_of_coverage=args.ics_out_of_coverage,
+    ).load()
 
 
 def _as_of(args: argparse.Namespace) -> date:

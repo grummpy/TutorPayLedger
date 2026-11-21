@@ -33,15 +33,58 @@ _HOLIDAY = {"HOLIDAY", "CLOSED", "NO-SCHOOL", "NOSCHOOL"}
 
 
 class IcsSchoolCalendar:
-    """Exception calendar built from one ICS document."""
+    """Exception calendar built from one ICS document.
 
-    def __init__(self, days: dict[date, SchoolDay], *, label: str = "ICS feed") -> None:
+    A local, user-supplied ICS file must declare the dates for which ordinary
+    weekdays may be assumed to be instructional days.  The file normally
+    records exceptions only, so treating unlisted summer dates as sessions is
+    unsafe.  Packaged sample fragments remain intentionally unbounded.
+    """
+
+    def __init__(
+        self,
+        days: dict[date, SchoolDay],
+        *,
+        label: str = "ICS feed",
+        effective_from: date | None = None,
+        effective_through: date | None = None,
+        out_of_coverage: str | None = None,
+    ) -> None:
+        has_coverage = any(
+            value is not None for value in (effective_from, effective_through, out_of_coverage)
+        )
+        if has_coverage and (
+            effective_from is None
+            or effective_through is None
+            or out_of_coverage not in {"closed", "error"}
+        ):
+            raise LedgerError(
+                "Local ICS coverage needs an effective start, effective end, and "
+                "out-of-coverage policy (closed or error)."
+            )
+        if effective_from is not None and effective_through is not None:
+            if effective_through < effective_from:
+                raise LedgerError("ICS effective end is before its effective start.")
         self.label = label
         self._days = days
+        self.effective_from = effective_from
+        self.effective_through = effective_through
+        self.out_of_coverage = out_of_coverage
 
     def describe(self, day: date) -> SchoolDay:
         if day.weekday() >= 5:
             return SchoolDay(day, DayKind.WEEKEND, None)
+        if (
+            self.effective_from is not None
+            and self.effective_through is not None
+            and (day < self.effective_from or day > self.effective_through)
+        ):
+            if self.out_of_coverage == "closed":
+                return SchoolDay(day, DayKind.BREAK, "Outside declared ICS coverage")
+            raise LedgerError(
+                f"{self.label} date {day.isoformat()} is outside its declared coverage "
+                f"({self.effective_from.isoformat()} through {self.effective_through.isoformat()})."
+            )
         return self._days.get(day) or SchoolDay(day, DayKind.IN_SESSION, None)
 
 
@@ -65,17 +108,49 @@ class IcsFileProvider:
 
     name = "ics"
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        effective_from: date | None = None,
+        effective_through: date | None = None,
+        out_of_coverage: str | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.effective_from = effective_from
+        self.effective_through = effective_through
+        self.out_of_coverage = out_of_coverage
 
     def load(self) -> IcsSchoolCalendar:
         if not self.path.is_file():
             raise LedgerError(f"ICS file not found: {self.path}")
+        if (
+            self.effective_from is None
+            or self.effective_through is None
+            or self.out_of_coverage not in {"closed", "error"}
+        ):
+            raise LedgerError(
+                "Local ICS coverage needs an effective start, effective end, and "
+                "out-of-coverage policy (closed or error)."
+            )
         text = self.path.read_text(encoding="utf-8")
-        return parse_ics(text, label=self.path.name)
+        return parse_ics(
+            text,
+            label=self.path.name,
+            effective_from=self.effective_from,
+            effective_through=self.effective_through,
+            out_of_coverage=self.out_of_coverage,
+        )
 
 
-def parse_ics(text: str, *, label: str = "ICS feed") -> IcsSchoolCalendar:
+def parse_ics(
+    text: str,
+    *,
+    label: str = "ICS feed",
+    effective_from: date | None = None,
+    effective_through: date | None = None,
+    out_of_coverage: str | None = None,
+) -> IcsSchoolCalendar:
     events = _events(text)
     days: dict[date, SchoolDay] = {}
     for event in events:
@@ -107,7 +182,13 @@ def parse_ics(text: str, *, label: str = "ICS feed") -> IcsSchoolCalendar:
             if cursor.weekday() < 5:
                 days[cursor] = SchoolDay(cursor, kind, name)
             cursor += timedelta(days=1)
-    return IcsSchoolCalendar(days, label=label)
+    return IcsSchoolCalendar(
+        days,
+        label=label,
+        effective_from=effective_from,
+        effective_through=effective_through,
+        out_of_coverage=out_of_coverage,
+    )
 
 
 def _as_date_field(value: object) -> tuple[date, bool] | None:

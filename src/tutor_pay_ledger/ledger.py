@@ -7,7 +7,7 @@ This module does not move money and does not store account numbers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, time
 from decimal import Decimal
 
@@ -101,6 +101,45 @@ class Payment:
 
 
 @dataclass(frozen=True)
+class PaymentCorrection:
+    """An auditable replacement amount for one recorded payment.
+
+    The original :class:`Payment` is retained unchanged.  This event changes
+    the amount used for the balance only from ``corrected_on`` until a
+    :class:`CorrectionReversal` is recorded.
+    """
+
+    id: str
+    payment_id: str
+    cycle_id: str
+    corrected_amount: Decimal
+    corrected_on: date
+    reason: str
+
+    def __post_init__(self) -> None:
+        check_id(self.id)
+        check_id(self.payment_id)
+        check_id(self.cycle_id)
+        parse_money(self.corrected_amount)
+        assert_no_secret(self.reason, "Correction reason")
+
+
+@dataclass(frozen=True)
+class CorrectionReversal:
+    """An immutable undo event for one payment correction."""
+
+    id: str
+    correction_id: str
+    reversed_on: date
+    reason: str
+
+    def __post_init__(self) -> None:
+        check_id(self.id)
+        check_id(self.correction_id)
+        assert_no_secret(self.reason, "Correction reversal reason")
+
+
+@dataclass(frozen=True)
 class SessionLine:
     day: date
     weight: Decimal
@@ -131,16 +170,56 @@ class CycleStanding:
         return (self.effective_end - self.as_of).days
 
 
+@dataclass(frozen=True)
+class PaymentCorrectionPreview:
+    """Balance comparison shown before a correction is saved."""
+
+    correction: PaymentCorrection
+    before: CycleStanding
+    after: CycleStanding
+
+    @property
+    def balance_delta(self) -> Decimal:
+        return self.after.balance - self.before.balance
+
+
+@dataclass(frozen=True)
+class CorrectionReversalPreview:
+    """Balance comparison shown before an undo event is saved."""
+
+    reversal: CorrectionReversal
+    before: CycleStanding
+    after: CycleStanding
+
+    @property
+    def balance_delta(self) -> Decimal:
+        return self.after.balance - self.before.balance
+
+
 @dataclass
 class Ledger:
     cycles: list[PayCycle]
     payments: list[Payment]
+    corrections: list[PaymentCorrection] = field(default_factory=list)
+    correction_reversals: list[CorrectionReversal] = field(default_factory=list)
 
     def cycle(self, cycle_id: str) -> PayCycle:
         for cycle in self.cycles:
             if cycle.id == cycle_id:
                 return cycle
         raise LedgerError(f"No cycle with id {cycle_id!r}.")
+
+    def payment(self, payment_id: str) -> Payment:
+        for payment in self.payments:
+            if payment.id == payment_id:
+                return payment
+        raise LedgerError(f"No payment with id {payment_id!r}.")
+
+    def correction(self, correction_id: str) -> PaymentCorrection:
+        for correction in self.corrections:
+            if correction.id == correction_id:
+                return correction
+        raise LedgerError(f"No payment correction with id {correction_id!r}.")
 
     def payments_for(self, cycle_id: str, *, through: date | None = None) -> list[Payment]:
         """Payments for a cycle, optionally limited to a historical date."""
@@ -150,6 +229,17 @@ class Ledger:
             for payment in self.payments
             if payment.cycle_id == cycle_id and (through is None or payment.paid_on <= through)
         ]
+
+    def effective_payments_for(self, cycle_id: str, *, through: date | None = None) -> list[Payment]:
+        """Return historical payments with active correction events applied."""
+
+        return _effective_payments(
+            self.payments,
+            self.corrections,
+            self.correction_reversals,
+            cycle_id,
+            through=through,
+        )
 
     def add_cycle(self, cycle: PayCycle) -> None:
         if any(existing.id == cycle.id for existing in self.cycles):
@@ -161,6 +251,150 @@ class Ledger:
         if any(existing.id == payment.id for existing in self.payments):
             raise LedgerError(f"A payment with id {payment.id!r} already exists.")
         self.payments.append(payment)
+
+    def add_correction(self, correction: PaymentCorrection) -> None:
+        self._validate_correction(correction)
+        self.corrections.append(correction)
+
+    def add_correction_reversal(self, reversal: CorrectionReversal) -> None:
+        correction = self.correction(reversal.correction_id)
+        if any(existing.id == reversal.id for existing in self.correction_reversals):
+            raise LedgerError(f"A correction reversal with id {reversal.id!r} already exists.")
+        if any(existing.correction_id == reversal.correction_id for existing in self.correction_reversals):
+            raise LedgerError(f"Correction {reversal.correction_id!r} is already reversed.")
+        if reversal.reversed_on < correction.corrected_on:
+            raise LedgerError("A correction cannot be undone before it was recorded.")
+        self.correction_reversals.append(reversal)
+
+    def _validate_correction(self, correction: PaymentCorrection) -> None:
+        original = self.payment(correction.payment_id)
+        if correction.cycle_id != original.cycle_id:
+            raise LedgerError("A payment correction must keep the original payment's cycle.")
+        if correction.corrected_on < original.paid_on:
+            raise LedgerError("A payment cannot be corrected before it was recorded.")
+        if any(existing.id == correction.id for existing in self.corrections):
+            raise LedgerError(f"A payment correction with id {correction.id!r} already exists.")
+        active = {
+            existing.payment_id
+            for existing in self.corrections
+            if not any(
+                reversal.correction_id == existing.id for reversal in self.correction_reversals
+            )
+        }
+        if correction.payment_id in active:
+            raise LedgerError(
+                f"Payment {correction.payment_id!r} already has an active correction; undo it first."
+            )
+
+
+def _effective_payments(
+    payments: list[Payment] | tuple[Payment, ...],
+    corrections: list[PaymentCorrection] | tuple[PaymentCorrection, ...],
+    reversals: list[CorrectionReversal] | tuple[CorrectionReversal, ...],
+    cycle_id: str,
+    *,
+    through: date | None,
+) -> list[Payment]:
+    """Apply correction events visible at ``through`` without changing history."""
+
+    reversed_ids = {
+        reversal.correction_id
+        for reversal in reversals
+        if through is None or reversal.reversed_on <= through
+    }
+    active: dict[str, PaymentCorrection] = {}
+    for correction in corrections:
+        if correction.cycle_id != cycle_id:
+            continue
+        if through is not None and correction.corrected_on > through:
+            continue
+        if correction.id not in reversed_ids:
+            active[correction.payment_id] = correction
+    result: list[Payment] = []
+    for payment in payments:
+        if payment.cycle_id != cycle_id or (through is not None and payment.paid_on > through):
+            continue
+        correction = active.get(payment.id)
+        if correction is None:
+            result.append(payment)
+        else:
+            result.append(
+                Payment(
+                    id=payment.id,
+                    cycle_id=payment.cycle_id,
+                    paid_on=payment.paid_on,
+                    amount=correction.corrected_amount,
+                    method=payment.method,
+                    memo=payment.memo,
+                )
+            )
+    return result
+
+
+def preview_payment_correction(
+    ledger: Ledger,
+    correction: PaymentCorrection,
+    calendar: SchoolCalendar,
+) -> PaymentCorrectionPreview:
+    """Calculate a correction's balance effect before saving it."""
+
+    ledger._validate_correction(correction)
+    cycle = ledger.cycle(correction.cycle_id)
+    before = project(
+        cycle,
+        calendar,
+        correction.corrected_on,
+        ledger.effective_payments_for(cycle.id, through=correction.corrected_on),
+    )
+    after = project(
+        cycle,
+        calendar,
+        correction.corrected_on,
+        _effective_payments(
+            ledger.payments,
+            [*ledger.corrections, correction],
+            ledger.correction_reversals,
+            cycle.id,
+            through=correction.corrected_on,
+        ),
+    )
+    return PaymentCorrectionPreview(correction=correction, before=before, after=after)
+
+
+def preview_correction_reversal(
+    ledger: Ledger,
+    reversal: CorrectionReversal,
+    calendar: SchoolCalendar,
+) -> CorrectionReversalPreview:
+    """Calculate an undo event's balance effect before saving it."""
+
+    correction = ledger.correction(reversal.correction_id)
+    if any(existing.id == reversal.id for existing in ledger.correction_reversals):
+        raise LedgerError(f"A correction reversal with id {reversal.id!r} already exists.")
+    if any(existing.correction_id == reversal.correction_id for existing in ledger.correction_reversals):
+        raise LedgerError(f"Correction {reversal.correction_id!r} is already reversed.")
+    if reversal.reversed_on < correction.corrected_on:
+        raise LedgerError("A correction cannot be undone before it was recorded.")
+    cycle = ledger.cycle(correction.cycle_id)
+    before = project(
+        cycle,
+        calendar,
+        reversal.reversed_on,
+        ledger.effective_payments_for(cycle.id, through=reversal.reversed_on),
+    )
+    after = project(
+        cycle,
+        calendar,
+        reversal.reversed_on,
+        _effective_payments(
+            ledger.payments,
+            ledger.corrections,
+            [*ledger.correction_reversals, reversal],
+            cycle.id,
+            through=reversal.reversed_on,
+        ),
+    )
+    return CorrectionReversalPreview(reversal=reversal, before=before, after=after)
 
 
 def effective_end_for(cycle: PayCycle, calendar: SchoolCalendar) -> date:

@@ -4,7 +4,15 @@ from datetime import date, time
 from decimal import Decimal
 
 from tutor_pay_ledger.calendars.fixture import build_sample_district_calendar
-from tutor_pay_ledger.ledger import PayCycle, Payment, project
+from tutor_pay_ledger.ledger import (
+    CorrectionReversal,
+    PayCycle,
+    Payment,
+    PaymentCorrection,
+    preview_correction_reversal,
+    preview_payment_correction,
+    project,
+)
 from tutor_pay_ledger.models import HalfDayPolicy, WeekendEndPolicy
 from tutor_pay_ledger.notes import draft_extend_note
 from tutor_pay_ledger.seed import SEED_CYCLE_ID, build_seed_ledger
@@ -149,3 +157,52 @@ def test_historical_projection_excludes_later_recorded_payments():
     assert early.balance == Decimal("440.00")
     assert later.paid == Decimal("300.00")
     assert later.balance == Decimal("240.00")
+
+
+def test_payment_correction_keeps_original_record_and_undo_restores_balance():
+    ledger = build_seed_ledger()
+    cycle = ledger.cycle(SEED_CYCLE_ID)
+    calendar = build_sample_district_calendar()
+    original = ledger.payments[0]
+    correction = PaymentCorrection(
+        id="cor_seed_check",
+        payment_id=original.id,
+        cycle_id=cycle.id,
+        corrected_amount=Decimal("200.00"),
+        corrected_on=date(2026, 10, 5),
+        reason="Synthetic check amount was entered too high.",
+    )
+    preview = preview_payment_correction(ledger, correction, calendar)
+    assert preview.before.balance == Decimal("300.00")
+    assert preview.after.balance == Decimal("340.00")
+    assert preview.balance_delta == Decimal("40.00")
+    assert original.amount == Decimal("240.00")
+
+    ledger.add_correction(correction)
+    corrected = project(
+        cycle,
+        calendar,
+        date(2026, 10, 5),
+        ledger.effective_payments_for(cycle.id, through=date(2026, 10, 5)),
+    )
+    assert corrected.balance == Decimal("340.00")
+    assert ledger.payments[0] == original
+    assert ledger.corrections[0].reason == "Synthetic check amount was entered too high."
+
+    reversal = CorrectionReversal(
+        id="rev_seed_check",
+        correction_id=correction.id,
+        reversed_on=date(2026, 10, 6),
+        reason="Synthetic correction undo.",
+    )
+    undo = preview_correction_reversal(ledger, reversal, calendar)
+    assert undo.before.balance == Decimal("340.00")
+    assert undo.after.balance == Decimal("300.00")
+    ledger.add_correction_reversal(reversal)
+    restored = project(
+        cycle,
+        calendar,
+        date(2026, 10, 6),
+        ledger.effective_payments_for(cycle.id, through=date(2026, 10, 6)),
+    )
+    assert restored.balance == Decimal("300.00")
